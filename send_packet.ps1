@@ -1,4 +1,5 @@
 # send_packet.ps1
+#Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 param(
     [string]$HostAddr = "127.0.0.1",
     [int]$Port = 5000
