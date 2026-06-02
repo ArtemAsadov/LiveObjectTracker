@@ -8,19 +8,30 @@ Console.WriteLine("=== Live Object Tracker ===");
 
 // TODO 1.2: TCP-сервер + BoundedChannel (10_000, Wait mode)
 // TODO 1.2.1: Добавляем BoundedChannel и базовую структуру
+// TODO 1.3: Worker pool (TaskCreationOptions.LongRunning)
 
 const int TcpPort = 5000;
 const int ChannelCapacity = 10_000;
 const int WorkersCount = 4; // TODO перейти на Enviroment
 
+var listener = new TcpListener(IPAddress.Loopback, TcpPort);
+
 // Gracefull shutdown
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (sender, e) =>
 {
+    if (cts.IsCancellationRequested)
+    {
+        Console.WriteLine("\n[Fatal] Повторный Ctrl+C. Жесткое завершение процесса...");
+        e.Cancel = false;
+        return;
+    }
+
     e.Cancel = true; // Отменяем стандартное значение
     //Интерапт
     Console.WriteLine("\n[Shutdown] Ctrl+C получен. Завершаем...");
     cts.Cancel();
+    listener.Stop(); // прерывает ожидание AcceptTcpClientAsync
 };
 
 //FullMode.Wait->когда канал полон, производитель блокируется (backpressure)
@@ -52,6 +63,8 @@ var workers = Enumerable.Range(0, WorkersCount).Select(i =>
             // Цикл прервется сам, когда вызовем channel.Writer.Complete()
             await foreach (var evt in channel.Reader.ReadAllAsync())
             {
+                if (cts.IsCancellationRequested) break; // Явно не даем стартануть полезную работу если был interupt
+
                 await Task.Delay(10, CancellationToken.None);
 
                 var count = Interlocked.Increment(ref processedCount);
@@ -66,7 +79,6 @@ var workers = Enumerable.Range(0, WorkersCount).Select(i =>
 }).ToArray();
 
 // TCP - сервер
-var listener = new TcpListener(IPAddress.Loopback, TcpPort);
 listener.Start();
 Console.WriteLine($"[TCP] Listening on port {TcpPort}...");
 
@@ -86,13 +98,19 @@ catch (ObjectDisposedException)
 {
     Console.WriteLine($"[TCP] Listner stopped {nameof(ObjectDisposedException)}");
 }
-catch (SocketException ex) when (ex.SocketErrorCode == SocketError.Interrupted)
+catch (Exception ex) when (cts.Token.IsCancellationRequested)
 {
-    Console.WriteLine($"[TCP] Listner stopped {nameof(SocketException)}.{SocketError.Interrupted}");
+    // В процессе выключения. listener.Stop() прервал AcceptTcpClientAsync.
+    // Плевать на тип исключения (SocketException, IOException и т.д.), мы просто выходим.
+    Console.WriteLine($"[TCP] Listener interrupted during shutdown: {ex.Message}");
+}
+catch (SocketException ex)
+{
+    // Если мы НЕ выключались, а сокет упал — это реальная ошибка, логируем её
+    Console.WriteLine($"[TCP] Unexpected Socket Error: {ex.Message}");
 }
 finally
 {
-    listener.Stop(); //Гарантированно закрываем
     Console.WriteLine("[TCP] Listner disposed.");
 }
 
@@ -123,6 +141,8 @@ async Task HandleClientAsync(
         {
             var bytesRead = await stream.ReadAsync(buffer, ct);
             if (bytesRead == 0) break; // клиент отключился
+            
+            if (ct.IsCancellationRequested) break; // Неначинать полезную раблоту если был interupt
 
             // Для теста: при получении любых байт от клиента, кидаем фейковое событие в канал
             Console.WriteLine($"[TCP] Received {bytesRead} bytes from client.");
@@ -145,13 +165,10 @@ async Task HandleClientAsync(
     }
 }
 
-// TODO 1.3: Worker pool (TaskCreationOptions.LongRunning)
 // TODO 1.4: Generator-client (~10k RPS)
 // TODO 1.5: Console metrics (produced/consumed RPS, pending, cache size)
 // TODO 2.1-2.2: PositionsCache (ReaderWriterLockSlim)
 // TODO 3.3-3.4: Batch writers (Postgres COPY + ClickHouse)
-
-Console.ReadLine();
 
 //--------------------------------
 public sealed class AsyncWaitGroup
@@ -171,5 +188,13 @@ public sealed class AsyncWaitGroup
         }
     }
 
-    public Task WaitAsync() => _tcs.Task;
+    public Task WaitAsync()
+    {
+        if (Volatile.Read(ref _count) == 0)
+        {
+            return Task.CompletedTask;
+        }
+
+        return _tcs.Task;
+    }
 }
