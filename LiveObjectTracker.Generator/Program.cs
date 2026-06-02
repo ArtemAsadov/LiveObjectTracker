@@ -4,7 +4,7 @@ using System.Text.Json;
 
 Console.WriteLine("=== Live Object Tracker Generator ===");
 
-const string Host = "127.0.0.1"; // TODO через env
+const string Host = "host.docker.internal"; // TODO через env (127.0.0.1)
 const int Port = 5000;
 const int EventsPerBatch = 100;
 const int DelayBetweenBatchMs = 10; // 100 событий / 10мс = 10_000 Rpc
