@@ -2,6 +2,7 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Threading.Channels;
+using System.Linq;
 
 Console.WriteLine("=== Live Object Tracker ===");
 
@@ -35,6 +36,34 @@ var channel = Channel.CreateBounded<CoordinateEvent>(
 Console.WriteLine($"Config: port={TcpPort}, capacity={ChannelCapacity}, workers={WorkersCount}");
 
 var waitGroup = new AsyncWaitGroup();
+long processedCount = 0; // Счетчик обработанных событий
+
+// Worker pool
+Console.WriteLine($"[Workers] Starting worker pool...");
+
+var workers = Enumerable.Range(0, WorkersCount).Select(i =>
+{
+    return Task.Factory.StartNew(
+        async () =>
+        {
+            Console.WriteLine($"[Worker {i} Started on Thread {Environment.CurrentManagedThreadId}]");
+
+            // Бесконечное асинхронное чтение
+            // Цикл прервется сам, когда вызовем channel.Writer.Complete()
+            await foreach (var evt in channel.Reader.ReadAllAsync())
+            {
+                await Task.Delay(10, CancellationToken.None);
+
+                var count = Interlocked.Increment(ref processedCount);
+                Console.WriteLine($"[Worker {i}] Processed Object: {evt.ObjectId} | Total: {count}");
+            }
+
+            Console.WriteLine($"[Worker {i}] Channel drained. Stopping");
+        },
+        CancellationToken.None, // Воркеры не оменяем через токен, они должны ДОЧИТАТЬ канал до конца
+        TaskCreationOptions.LongRunning, // Выделенные потоки не обьедаем thread pool
+        TaskScheduler.Default).Unwrap();// Разварачиваем Task<Task> иначе пролетим
+}).ToArray();
 
 // TCP - сервер
 var listener = new TcpListener(IPAddress.Loopback, TcpPort);
@@ -68,10 +97,18 @@ finally
 }
 
 // Аналог wg.Wait() в Go
-Console.WriteLine("[Shutdown] Waiting for active clients to finish (WaitGroup)...");
+Console.WriteLine("[Shutdown] 1. Waiting for active clients...");
 await waitGroup.WaitAsync();
-Console.WriteLine("[Shutdown] All clients disconnected. Server stopped gracefully.");
 
+Console.WriteLine("[Shutdown] 2. Conpleting channel...");
+channel.Writer.Complete(); // говорим воркерам что работы больше нет, ДОЕДАЙТЕ ЧТО ОСТАЛОСЬ и выходите
+
+Console.WriteLine("[Shutdown] 3. Waiting for workers to drain...");
+await Task.WhenAll(workers); // Ждем пока все воркеры выйдут из ReadAllASync
+
+Console.WriteLine($"[Shutdown] Done! Total processed: {processedCount}. Bye.");
+
+//--------------------------------
 async Task HandleClientAsync(
     TcpClient client,
     ChannelWriter<CoordinateEvent> writer,
@@ -87,18 +124,18 @@ async Task HandleClientAsync(
             var bytesRead = await stream.ReadAsync(buffer, ct);
             if (bytesRead == 0) break; // клиент отключился
 
-            //TODO: Распарсить JSON и отправить в channel
-            Console.WriteLine($"[TCP] Received {bytesRead} bytes");
+            // Для теста: при получении любых байт от клиента, кидаем фейковое событие в канал
+            Console.WriteLine($"[TCP] Received {bytesRead} bytes from client.");
+            var dummyEvent = new CoordinateEvent(
+                ObjectId: (ulong)bytesRead,
+                X: 1, Y: 2, Z: 3,
+                Timestamp: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+
+            await writer.WriteAsync(dummyEvent, ct);
         }
     }
-    catch (OperationCanceledException)
-    {
-        Console.WriteLine("[TCP] Client handler cancelled.");
-    }
-    catch (IOException)
-    {
-        Console.WriteLine("[TCP] Client connection broken.");
-    }
+    catch (OperationCanceledException) { Console.WriteLine("[TCP] Client handler cancelled."); }
+    catch (IOException) { Console.WriteLine("[TCP] Client connection broken."); }
     finally
     {
         waitGroup.Done();
