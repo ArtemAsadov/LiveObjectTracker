@@ -4,12 +4,17 @@ using System.Threading.Channels;
 using System.Linq;
 using System.Buffers;
 using LiveObjectTracker.DomainModel.Models;
+using System.Collections.Concurrent;
+using LiveObjectTracker.Service;
 
 Console.WriteLine("=== Live Object Tracker ===");
 
 // TODO 1.2: TCP-сервер + BoundedChannel (10_000, Wait mode)
 // TODO 1.2.1: Добавляем BoundedChannel и базовую структуру
 // TODO 1.3: Worker pool (TaskCreationOptions.LongRunning)
+// TODO 1.4: Generator-client (~10k RPS)
+// TODO 1.5: Console metrics (produced/consumed RPS, pending, cache size)
+// TODO 2.1-2.2: PositionsCache (ReaderWriterLockSlim)
 
 const int TcpPort = 5000;
 const int ChannelCapacity = 10_000;
@@ -49,6 +54,36 @@ Console.WriteLine($"Config: port={TcpPort}, capacity={ChannelCapacity}, workers=
 
 var waitGroup = new AsyncWaitGroup();
 long processedCount = 0; // Счетчик обработанных событий
+long producedCount = 0;  // Счетчик принятых от клиентов событий
+var positionsCache = new PositionsCache(cts.Token);
+
+// Metrics
+_ = Task.Run(async () =>
+{
+    long prevProduced = 0;
+    long prevConsumed = 0;
+
+    while (!cts.Token.IsCancellationRequested)
+    {
+        await Task.Delay(1000, cts.Token);
+
+        var curProduced = Interlocked.Read(ref producedCount);
+        var curConsumed = Interlocked.Read(ref processedCount);
+
+        var rpsProduced = curProduced - prevProduced;
+        var rpsConsumed = curConsumed - prevConsumed;
+
+        prevProduced = curProduced;
+        prevConsumed = curConsumed;
+
+        Console.WriteLine(
+            $"[Metrics] Produced: {rpsProduced,6} RPS | " +
+            $"Consumed: {rpsConsumed,6} RPS | " +
+            $"Pending: {channel.Reader.Count,6} | " +
+            $"Cache: {positionsCache.Count,7}");
+    }
+}, cts.Token);
+
 
 // Worker pool
 Console.WriteLine($"[Workers] Starting worker pool...");
@@ -66,11 +101,8 @@ var workers = Enumerable.Range(0, WorkersCount).Select(i =>
             {
                 if (cts.IsCancellationRequested) break; // Явно не даем стартануть полезную работу если был interupt
                 
-                await Task.Delay(10, CancellationToken.None);
-                Console.WriteLine(evt);
-
+                positionsCache.Set(evt);
                 var count = Interlocked.Increment(ref processedCount);
-                Console.WriteLine($"[Worker {i}] Processed Object: {evt.ObjectId} | Total: {count}");
             }
 
             Console.WriteLine($"[Worker {i}] Channel drained. Stopping");
@@ -115,6 +147,7 @@ finally
 {
     Console.WriteLine("[TCP] Listner disposed.");
 }
+
 
 // Аналог wg.Wait() в Go
 Console.WriteLine("[Shutdown] 1. Waiting for active clients...");
@@ -178,6 +211,7 @@ async Task HandleClientAsync(
                 payloadBuffer.AsSpan(0, payloadLength));
 
             await writer.WriteAsync(evt, ct); // in evt только для 64-128 байт
+            Interlocked.Increment(ref producedCount);
         }
     }
     catch (OperationCanceledException) { Console.WriteLine("[TCP] Client handler cancelled."); }
@@ -192,9 +226,7 @@ async Task HandleClientAsync(
     }
 }
 
-// TODO 1.4: Generator-client (~10k RPS)
-// TODO 1.5: Console metrics (produced/consumed RPS, pending, cache size)
-// TODO 2.1-2.2: PositionsCache (ReaderWriterLockSlim)
+
 // TODO 3.3-3.4: Batch writers (Postgres COPY + ClickHouse)
 
 //--------------------------------
