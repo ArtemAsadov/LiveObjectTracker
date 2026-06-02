@@ -4,7 +4,7 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 
-namespace LiveObjectTracker.Service.Models;
+namespace LiveObjectTracker.DomainModel.Models;
 
 public readonly record struct CoordinateEvent(
     ulong ObjectId,

@@ -1,9 +1,9 @@
-﻿using LiveObjectTracker.Service.Models;
-using System.Net;
+﻿using System.Net;
 using System.Net.Sockets;
 using System.Threading.Channels;
 using System.Linq;
 using System.Buffers;
+using LiveObjectTracker.DomainModel.Models;
 
 Console.WriteLine("=== Live Object Tracker ===");
 
@@ -177,11 +177,12 @@ async Task HandleClientAsync(
             var evt = System.Text.Json.JsonSerializer.Deserialize<CoordinateEvent>(
                 payloadBuffer.AsSpan(0, payloadLength));
 
-            await writer.WriteAsync(evt, ct);
+            await writer.WriteAsync(evt, ct); // in evt только для 64-128 байт
         }
     }
     catch (OperationCanceledException) { Console.WriteLine("[TCP] Client handler cancelled."); }
     catch (IOException) { Console.WriteLine("[TCP] Client connection broken."); }
+    catch (Exception ex) { Console.WriteLine($"[TCP] Unexpected Error:{ex.Message}"); }
     finally
     {
         waitGroup.Done();
