@@ -44,7 +44,7 @@ try
             await stream.WriteAsync(lenBytes, cts.Token);
             await stream.WriteAsync(jsonBytes, cts.Token);
             sentCount++;
-            id++
+            id++;
         }
 
         Console.WriteLine($"[Generator] Sent: {sentCount,10} events");
