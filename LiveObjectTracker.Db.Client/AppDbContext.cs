@@ -16,8 +16,19 @@ public class AppDbContext: DbContext
     {
         modelBuilder.Entity<CoordinateEntity>(entity =>
         {
+            // Таблица в lowercase
+            entity.ToTable("coordinates");
+
+            // Маппинг колонок на snake_case
             entity.HasKey(e => e.ObjectId);
-            entity.Property(e => e.ObjectId).ValueGeneratedNever();
+            entity.Property(e => e.ObjectId)
+                .HasColumnName("object_id")
+                .ValueGeneratedNever();
+
+            entity.Property(e => e.X).HasColumnName("x");
+            entity.Property(e => e.Y).HasColumnName("y");
+            entity.Property(e => e.Z).HasColumnName("z");
+            entity.Property(e => e.Timestamp).HasColumnName("timestamp");
         });
     }
 }
