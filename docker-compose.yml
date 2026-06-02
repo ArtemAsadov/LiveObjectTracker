@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15
+    container_name: live-tracker-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: mysecretpassword
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - live-tracker-network
+    restart: unless-stopped
+
+  # LiveObjectTracker Service
+  service:
+    build:
+      context: .
+      dockerfile: LiveObjectTracker.Service/Dockerfile
+    container_name: live-tracker-service
+    environment:
+      - ConnectionStrings__Postgres=Host=postgres;Port=5432;Username=postgres;Password=mysecretpassword;Database=postgres;Maximum Pool Size=20;
+      - ASPNETCORE_ENVIRONMENT=Production
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - live-tracker-network
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+
+  # Generator (optional - can be started separately)
+  generator:
+    build:
+      context: .
+      dockerfile: LiveObjectTracker.Generator/Dockerfile
+    container_name: live-tracker-generator
+    depends_on:
+      - service
+    networks:
+      - live-tracker-network
+    command: ["tail", "-f", "/dev/null"] 
+    stdin_open: true
+    tty: true
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  live-tracker-network:
+    driver: bridge
