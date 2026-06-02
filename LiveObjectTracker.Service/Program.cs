@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading.Channels;
 using System.Linq;
+using System.Buffers;
 
 Console.WriteLine("=== Live Object Tracker ===");
 
@@ -64,8 +65,9 @@ var workers = Enumerable.Range(0, WorkersCount).Select(i =>
             await foreach (var evt in channel.Reader.ReadAllAsync())
             {
                 if (cts.IsCancellationRequested) break; // Явно не даем стартануть полезную работу если был interupt
-
+                
                 await Task.Delay(10, CancellationToken.None);
+                Console.WriteLine(evt);
 
                 var count = Interlocked.Increment(ref processedCount);
                 Console.WriteLine($"[Worker {i}] Processed Object: {evt.ObjectId} | Total: {count}");
@@ -132,26 +134,50 @@ async Task HandleClientAsync(
     ChannelWriter<CoordinateEvent> writer,
     CancellationToken ct = default)
 {
+    const int LengthPrefixSize = 4;
+    const int MaxPayloadSize = 64 * 1024; // 64 кб
+
     using var stream = client.GetStream(); //Dispose при socket.Closed()
-    var buffer = new byte[1024];
+    var lenBuf = new byte[LengthPrefixSize];
+    var payloadBuffer = ArrayPool<byte>.Shared.Rent(MaxPayloadSize);
 
     try
     {
         while (!cts.Token.IsCancellationRequested)
         {
-            var bytesRead = await stream.ReadAsync(buffer, ct);
-            if (bytesRead == 0) break; // клиент отключился
-            
-            if (ct.IsCancellationRequested) break; // Неначинать полезную раблоту если был interupt
+            // Читаем префикс длинны (4 байта)
+            int totalRead = 0;
+            int read;
+            while ((read = await stream.ReadAsync(lenBuf.AsMemory(totalRead, 4 - totalRead), ct)) > 0)
+            {
+                totalRead += read;
+                if (totalRead == LengthPrefixSize) break;
+            }
 
-            // Для теста: при получении любых байт от клиента, кидаем фейковое событие в канал
-            Console.WriteLine($"[TCP] Received {bytesRead} bytes from client.");
-            var dummyEvent = new CoordinateEvent(
-                ObjectId: (ulong)bytesRead,
-                X: 1, Y: 2, Z: 3,
-                Timestamp: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            if (read == 0 || ct.IsCancellationRequested) break;
 
-            await writer.WriteAsync(dummyEvent, ct);
+            int payloadLength = BitConverter.ToInt32(lenBuf);
+            if (payloadLength <= 0 || payloadLength > MaxPayloadSize)
+            {
+                Console.WriteLine($"[TCP] Invalid payload length: {payloadLength}");
+                break;
+            }
+
+            // Читаем JSON-payload
+            totalRead = 0;
+            while ((read = await stream.ReadAsync(payloadBuffer.AsMemory(totalRead, payloadLength - totalRead), ct)) > 0)
+            {
+                totalRead += read;
+                if (totalRead == payloadLength) break;
+            }
+
+            if (read == 0 || totalRead < payloadLength || ct.IsCancellationRequested) break;
+
+            // Парсим из Span (Срез в GO)
+            var evt = System.Text.Json.JsonSerializer.Deserialize<CoordinateEvent>(
+                payloadBuffer.AsSpan(0, payloadLength));
+
+            await writer.WriteAsync(evt, ct);
         }
     }
     catch (OperationCanceledException) { Console.WriteLine("[TCP] Client handler cancelled."); }
