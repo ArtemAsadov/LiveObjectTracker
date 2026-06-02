@@ -1,11 +1,15 @@
-﻿using System.Net;
+﻿using LiveObjectTracker.Db.Client.Extensions;
+using LiveObjectTracker.Db.Client.Services;
+using LiveObjectTracker.DomainModel.Models;
+using LiveObjectTracker.Service;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using System.Buffers;
+using System.Collections.Concurrent;
+using System.Linq;
+using System.Net;
 using System.Net.Sockets;
 using System.Threading.Channels;
-using System.Linq;
-using System.Buffers;
-using LiveObjectTracker.DomainModel.Models;
-using System.Collections.Concurrent;
-using LiveObjectTracker.Service;
 
 Console.WriteLine("=== Live Object Tracker ===");
 
@@ -24,6 +28,22 @@ var listener = new TcpListener(IPAddress.Loopback, TcpPort);
 
 // Gracefull shutdown
 using var cts = new CancellationTokenSource();
+
+//DI
+var services = new ServiceCollection();
+services.AddCoordinateDb(
+    "Host=localhost;Port=5432;Username=postgres;Password=mysecretpassword;Database=postgres;Maximum Pool Size=20;");//TODO env, пароль спрятать за секретами
+var serviceProvider = services.BuildServiceProvider();
+
+var coordinateWriter = serviceProvider.GetRequiredService<ICoordinateWriter>();
+var hostedServices = serviceProvider.GetServices<IHostedService>().ToList();
+
+foreach (var service in hostedServices)
+{
+    await service.StartAsync(cts.Token);
+}
+
+
 Console.CancelKeyPress += (sender, e) =>
 {
     if (cts.IsCancellationRequested)
@@ -102,6 +122,10 @@ var workers = Enumerable.Range(0, WorkersCount).Select(i =>
                 if (cts.IsCancellationRequested) break; // Явно не даем стартануть полезную работу если был interupt
                 
                 positionsCache.Set(evt);
+
+                //Пишим в DB
+                _ = coordinateWriter.WriteAsync(evt, CancellationToken.None);
+
                 var count = Interlocked.Increment(ref processedCount);
             }
 
@@ -146,6 +170,13 @@ catch (SocketException ex)
 finally
 {
     Console.WriteLine("[TCP] Listner disposed.");
+}
+
+
+Console.WriteLine("[Shutdown] Flushing DB...");
+foreach (var service in hostedServices)
+{
+    await service.StopAsync(CancellationToken.None);
 }
 
 
