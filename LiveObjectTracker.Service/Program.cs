@@ -12,6 +12,16 @@ const int TcpPort = 5000;
 const int ChannelCapacity = 10_000;
 const int WorkersCount = 4; // TODO перейти на Enviroment
 
+// Gracefull shutdown
+using var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (sender, e) =>
+{
+    e.Cancel = true; // Отменяем стандартное значение
+    //Интерапт
+    Console.WriteLine("\n[Shutdown] Ctrl+C получен. Завершаем...");
+    cts.Cancel();
+};
+
 //FullMode.Wait->когда канал полон, производитель блокируется (backpressure)
 var channel = Channel.CreateBounded<CoordinateEvent>(
     new BoundedChannelOptions(ChannelCapacity)
@@ -24,42 +34,75 @@ var channel = Channel.CreateBounded<CoordinateEvent>(
 
 Console.WriteLine($"Config: port={TcpPort}, capacity={ChannelCapacity}, workers={WorkersCount}");
 
-// TCP - сервер
-_ = Task.Run(async () =>
-{
-    var listener = new TcpListener(IPAddress.Loopback, TcpPort);
-    listener.Start();
-    Console.WriteLine($"[TCP] Listening on port {TcpPort}...");
+var waitGroup = new AsyncWaitGroup();
 
-    while (true)
+// TCP - сервер
+var listener = new TcpListener(IPAddress.Loopback, TcpPort);
+listener.Start();
+Console.WriteLine($"[TCP] Listening on port {TcpPort}...");
+
+try
+{
+    while (!cts.Token.IsCancellationRequested)
     {
         var client = await listener.AcceptTcpClientAsync();
         Console.WriteLine($"[TCP] Client connected from {client.Client.RemoteEndPoint}");
 
-        _ = Task.Run(() => HandleClientAsync(client, channel.Writer));
+        waitGroup.Add();
+
+        _ = HandleClientAsync(client, channel.Writer, cts.Token);
     }
-});
+}
+catch (ObjectDisposedException)
+{
+    Console.WriteLine($"[TCP] Listner stopped {nameof(ObjectDisposedException)}");
+}
+catch (SocketException ex) when (ex.SocketErrorCode == SocketError.Interrupted)
+{
+    Console.WriteLine($"[TCP] Listner stopped {nameof(SocketException)}.{SocketError.Interrupted}");
+}
+finally
+{
+    listener.Stop(); //Гарантированно закрываем
+    Console.WriteLine("[TCP] Listner disposed.");
+}
 
-Console.WriteLine("[TCP] Server is running");
+// Аналог wg.Wait() в Go
+Console.WriteLine("[Shutdown] Waiting for active clients to finish (WaitGroup)...");
+await waitGroup.WaitAsync();
+Console.WriteLine("[Shutdown] All clients disconnected. Server stopped gracefully.");
 
-static async Task HandleClientAsync(TcpClient client, ChannelWriter<CoordinateEvent> writer)
+async Task HandleClientAsync(
+    TcpClient client,
+    ChannelWriter<CoordinateEvent> writer,
+    CancellationToken ct = default)
 {
     using var stream = client.GetStream(); //Dispose при socket.Closed()
     var buffer = new byte[1024];
 
     try
     {
-        while (true)
+        while (!cts.Token.IsCancellationRequested)
         {
-            var bytesRead = await stream.ReadAsync(buffer);
+            var bytesRead = await stream.ReadAsync(buffer, ct);
             if (bytesRead == 0) break; // клиент отключился
 
             //TODO: Распарсить JSON и отправить в channel
             Console.WriteLine($"[TCP] Received {bytesRead} bytes");
         }
     }
+    catch (OperationCanceledException)
+    {
+        Console.WriteLine("[TCP] Client handler cancelled.");
+    }
+    catch (IOException)
+    {
+        Console.WriteLine("[TCP] Client connection broken.");
+    }
     finally
     {
+        waitGroup.Done();
+
         client.Close();
         Console.WriteLine($"[TCP] Client disconnected");
     }
@@ -72,3 +115,24 @@ static async Task HandleClientAsync(TcpClient client, ChannelWriter<CoordinateEv
 // TODO 3.3-3.4: Batch writers (Postgres COPY + ClickHouse)
 
 Console.ReadLine();
+
+//--------------------------------
+public sealed class AsyncWaitGroup
+{
+    private int _count;
+
+    // RunContinuationsAsynchronously нужно, чтобы коллбеки не выполнялись в потоке, вызвавшем Done()
+    private readonly TaskCompletionSource _tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public void Add(int count = 1) => Interlocked.Add(ref _count, count);
+
+    public void Done()
+    {
+        if (Interlocked.Decrement(ref _count) == 0)
+        {
+            _tcs.TrySetResult();
+        }
+    }
+
+    public Task WaitAsync() => _tcs.Task;
+}
